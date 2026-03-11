@@ -93,7 +93,7 @@ def flash_attention(
     # apply attention
     if (version is None or version == 3) and FLASH_ATTN_3_AVAILABLE:
         # Note: dropout_p, window_size are not supported in FA3 now.
-        x = flash_attn_interface.flash_attn_varlen_func(
+        fa3_kwargs = dict(
             q=q,
             k=k,
             v=v,
@@ -101,13 +101,19 @@ def flash_attention(
                 0, dtype=torch.int32).to(q.device, non_blocking=True),
             cu_seqlens_k=torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(
                 0, dtype=torch.int32).to(q.device, non_blocking=True),
-            seqused_q=None,
-            seqused_k=None,
             max_seqlen_q=lq,
             max_seqlen_k=lk,
             softmax_scale=softmax_scale,
             causal=causal,
-            deterministic=deterministic)[0].unflatten(0, (b, lq))
+            deterministic=deterministic,
+        )
+        import inspect
+        fa3_sig = inspect.signature(flash_attn_interface.flash_attn_varlen_func)
+        if 'seqused_q' in fa3_sig.parameters:
+            fa3_kwargs['seqused_q'] = None
+            fa3_kwargs['seqused_k'] = None
+        x = flash_attn_interface.flash_attn_varlen_func(
+            **fa3_kwargs)[0].unflatten(0, (b, lq))
     else:
         assert FLASH_ATTN_2_AVAILABLE
         x = flash_attn.flash_attn_varlen_func(
