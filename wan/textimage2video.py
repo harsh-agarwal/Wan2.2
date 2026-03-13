@@ -577,12 +577,39 @@ class WanTI2V:
                 ])
                 timestep = temp_ts.unsqueeze(0)
 
+                cond_kwargs = dict(arg_c)
+                uncond_kwargs = dict(arg_null)
+                # If patch embedding expects channel-concat conditioning,
+                # provide source latent as y.
+                if self.model.patch_embedding.in_channels == latent_model_input[0].shape[0] * 2:
+                    y_cond = z[0]
+                    # Align temporal/spatial shape with current latent before channel concat.
+                    # z from image encode is typically [C,1,H,W], while latent is [C,F,H,W].
+                    if y_cond.shape != latent_model_input[0].shape:
+                        _, target_f, target_h, target_w = latent_model_input[0].shape
+                        # Match spatial resolution if needed.
+                        if y_cond.shape[-2:] != (target_h, target_w):
+                            y_cond = torch.nn.functional.interpolate(
+                                y_cond.unsqueeze(0),
+                                size=(target_h, target_w),
+                                mode='nearest'
+                            ).squeeze(0)
+                        # Match temporal length if needed.
+                        if y_cond.shape[1] == 1 and target_f > 1:
+                            y_cond = y_cond.repeat(1, target_f, 1, 1)
+                        elif y_cond.shape[1] != target_f:
+                            # Fallback: tile/crop to target temporal length.
+                            reps = math.ceil(target_f / y_cond.shape[1])
+                            y_cond = y_cond.repeat(1, reps, 1, 1)[:, :target_f]
+                    cond_kwargs["y"] = [y_cond]
+                    uncond_kwargs["y"] = [y_cond]
+
                 noise_pred_cond = self.model(
-                    latent_model_input, t=timestep, **arg_c)[0]
+                    latent_model_input, t=timestep, **cond_kwargs)[0]
                 if offload_model:
                     torch.cuda.empty_cache()
                 noise_pred_uncond = self.model(
-                    latent_model_input, t=timestep, **arg_null)[0]
+                    latent_model_input, t=timestep, **uncond_kwargs)[0]
                 if offload_model:
                     torch.cuda.empty_cache()
                 noise_pred = noise_pred_uncond + guide_scale * (
