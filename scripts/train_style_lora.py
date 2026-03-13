@@ -21,9 +21,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import yaml
+from PIL import Image
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 # Add parent directory to path
@@ -32,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from peft import LoraConfig, get_peft_model
 from wan.textimage2video import WanTI2V
 from wan.configs import WAN_CONFIGS
+from wan.utils.utils import save_video
 
 
 logging.basicConfig(
@@ -223,6 +226,8 @@ class LoRATrainer:
         self.logging_dir = Path(config['training']['logging_dir'])
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.logging_dir.mkdir(parents=True, exist_ok=True)
+        self.writer = SummaryWriter(log_dir=str(self.logging_dir))
+        self.global_step = 0
         
         # Save config
         with open(self.output_dir / "config.yaml", 'w') as f:
@@ -421,6 +426,7 @@ class LoRATrainer:
             num_frames=data_config['num_frames'],
             resolution=tuple(data_config['resolution'])
         )
+        self.val_dataset = val_dataset
         
         # Create data loaders
         train_num_workers = int(self.config['training'].get('num_workers', 0))
@@ -445,6 +451,103 @@ class LoRATrainer:
         logger.info(f"Val samples: {len(val_dataset)}")
         
         return train_loader, val_loader
+
+    def _load_source_image_from_video(self, rel_video_path):
+        """
+        Read first frame from source video and return PIL RGB image.
+        """
+        full_path = self.val_dataset.resolve_video_path(rel_video_path)
+        if full_path is None:
+            raise FileNotFoundError(f"Cannot resolve source video path: {rel_video_path}")
+        cap = cv2.VideoCapture(str(full_path))
+        ret, frame = cap.read()
+        cap.release()
+        if not ret:
+            raise RuntimeError(f"Failed to read first frame from {full_path}")
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(frame)
+
+    def _log_video_to_tensorboard(self, tag, vid_tensor, global_step, fps=16):
+        """
+        Log a video tensor to TensorBoard.
+
+        vid_tensor: [C, T, H, W] float in [0, 1]
+        Tries add_video first; falls back to a frame grid image if moviepy is
+        not compatible (e.g. moviepy >= 2.0 dropped moviepy.editor).
+        """
+        # [C, T, H, W] -> [1, T, C, H, W] for add_video
+        tb_vid = vid_tensor.permute(1, 0, 2, 3).unsqueeze(0)
+        try:
+            self.writer.add_video(tag, tb_vid, global_step=global_step, fps=fps)
+        except Exception:
+            # Fallback: log evenly-spaced frames as a horizontal image strip
+            frames = vid_tensor.permute(1, 2, 3, 0).mul(255).byte().numpy()  # [T, H, W, C]
+            T = frames.shape[0]
+            indices = np.linspace(0, T - 1, min(8, T), dtype=int)
+            grid = np.concatenate([frames[j] for j in indices], axis=1)  # [H, W*N, C]
+            grid_tensor = torch.from_numpy(grid).permute(2, 0, 1).float().div(255)
+            self.writer.add_image(tag, grid_tensor, global_step=global_step)
+
+    def generate_val_previews(self, epoch):
+        """
+        Generate qualitative previews from validation samples.
+        """
+        preview_every = int(self.config['training'].get('preview_every_epochs', 1))
+        if preview_every <= 0 or (epoch + 1) % preview_every != 0:
+            return
+        preview_n = int(self.config['training'].get('preview_num_samples', 5))
+        preview_n = max(0, min(preview_n, len(self.val_dataset.samples)))
+        if preview_n == 0:
+            logger.info("Skipping val previews: no validation samples.")
+            return
+
+        infer_cfg = self.config.get('inference', {})
+        sampling_steps = int(infer_cfg.get('preview_sampling_steps', infer_cfg.get('num_inference_steps', 30)))
+        guide_scale = float(infer_cfg.get('guidance_scale', 5.0))
+        offload_model = bool(infer_cfg.get('offload_model', True))
+        seed = int(infer_cfg.get('seed', 42))
+        width, height = self.config['data']['resolution']
+        frame_num = int(self.config['data'].get('num_frames', 49))
+
+        preview_dir = self.output_dir / "val_previews" / f"epoch_{epoch + 1:03d}"
+        preview_dir.mkdir(parents=True, exist_ok=True)
+
+        logger.info(f"Generating {preview_n} val previews for epoch {epoch + 1} ...")
+        was_training = self.model.model.training
+        self.model.model.eval()
+        saved_files = []
+        preview_tensors = []
+        with torch.no_grad():
+            for i in range(preview_n):
+                sample = self.val_dataset.samples[i]
+                prompt = sample.get("instruction", "")
+                try:
+                    src_img = self._load_source_image_from_video(sample["source_path"])
+                    video = self.model.generate(
+                        input_prompt=prompt,
+                        img=src_img,
+                        size=(width, height),
+                        frame_num=frame_num,
+                        sample_solver='unipc',
+                        sampling_steps=sampling_steps,
+                        guide_scale=guide_scale,
+                        seed=seed + i,
+                        offload_model=offload_model,
+                    )
+                    out_path = preview_dir / f"sample_{i:02d}.mp4"
+                    save_video(video, str(out_path))
+                    saved_files.append(str(out_path))
+                    # video is [C, T, H, W] float tensor in [-1,1]; normalize to [0,1]
+                    preview_tensors.append(video.cpu().float().add(1).div(2).clamp(0, 1))
+                except Exception as e:
+                    logger.warning(f"Preview generation failed for val sample {i}: {e}")
+        if was_training:
+            self.model.model.train()
+
+        if saved_files:
+            logger.info(f"Saved {len(saved_files)} val previews to {preview_dir}")
+            for i, (path, vid_tensor) in enumerate(zip(saved_files, preview_tensors)):
+                self._log_video_to_tensorboard(f"val/preview_{i:02d}", vid_tensor, epoch)
     
     def setup_optimizer(self):
         """Setup optimizer and scheduler."""
@@ -576,6 +679,11 @@ class LoRATrainer:
                 f"loss reduce in {(time.perf_counter() - t6):.3f}s | "
                 f"total compute_loss={(time.perf_counter() - t0):.3f}s | loss={loss.item():.6f}"
             )
+            self.writer.add_scalar(
+                "timing/compute_loss_total_s",
+                time.perf_counter() - t0,
+                self.global_step
+            )
             self._debug_loss_seen += 1
         return loss
     
@@ -612,6 +720,9 @@ class LoRATrainer:
             # Logging
             total_loss += loss.item()
             progress_bar.set_postfix({'loss': loss.item()})
+            self.writer.add_scalar("train/loss_step", loss.item(), self.global_step)
+            self.writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], self.global_step)
+            self.global_step += 1
             
             # Save checkpoint
             if (step + 1) % self.config['training']['save_steps'] == 0:
@@ -619,6 +730,7 @@ class LoRATrainer:
         
         avg_loss = total_loss / len(train_loader)
         logger.info(f"Epoch {epoch} - Average loss: {avg_loss:.4f}")
+        self.writer.add_scalar("train/loss_epoch", avg_loss, epoch)
         
         return avg_loss
     
@@ -639,6 +751,7 @@ class LoRATrainer:
         
         avg_loss = total_loss / len(val_loader)
         logger.info(f"Validation loss: {avg_loss:.4f}")
+        self.writer.add_scalar("val/loss_epoch", avg_loss, self.current_epoch)
         
         return avg_loss
     
@@ -667,6 +780,7 @@ class LoRATrainer:
         best_val_loss = float('inf')
         
         for epoch in range(self.config['training']['num_epochs']):
+            self.current_epoch = epoch
             logger.info(f"\n{'='*80}")
             logger.info(f"Epoch {epoch + 1}/{self.config['training']['num_epochs']}")
             logger.info(f"{'='*80}")
@@ -690,6 +804,9 @@ class LoRATrainer:
             
             # Step scheduler
             scheduler.step()
+
+            # Qualitative preview generation
+            self.generate_val_previews(epoch)
             
             # Save checkpoint
             if (epoch + 1) % 5 == 0:
@@ -699,6 +816,8 @@ class LoRATrainer:
         final_path = self.output_dir / "final"
         self.model.model.save_pretrained(final_path)
         logger.info(f"\n✅ Training complete! Final model saved to {final_path}")
+        self.writer.flush()
+        self.writer.close()
 
 
 def load_config(config_path):
