@@ -257,6 +257,11 @@ class LoRATrainer:
             init_on_cpu=False,
             convert_model_dtype=self.config['inference']['convert_model_dtype']
         )
+
+        # Expand input projection for channel-concat conditioning:
+        # x and y are concatenated along channels in WanModel.forward when y is passed.
+        # TI2V checkpoints may ship with patch_embedding.in_channels = Cz, while concat needs 2*Cz.
+        self._expand_patch_embedding_for_concat_condition()
         
         # Configure LoRA
         target_modules = resolve_lora_target_modules(
@@ -270,11 +275,18 @@ class LoRATrainer:
             lora_dropout=self.config['model']['lora_dropout'],
             target_modules=target_modules,
             bias="none",
+            modules_to_save=["patch_embedding"],
         )
         
         # Apply LoRA to the DiT model
         logger.info("Applying LoRA to DiT model...")
         self.model.model = get_peft_model(self.model.model, lora_config)
+
+        # Keep input projection trainable so the newly-added conditioning channels can learn.
+        base_model = self.model.model.get_base_model()
+        for p in base_model.patch_embedding.parameters():
+            p.requires_grad = True
+
         self.model.model.print_trainable_parameters()
         
         # Print trainable parameters
@@ -283,6 +295,52 @@ class LoRATrainer:
         logger.info(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({100 * trainable_params / total_params:.2f}%)")
         
         return self.model
+
+    def _expand_patch_embedding_for_concat_condition(self):
+        """
+        Expand Conv3d input channels from C -> 2C so channel-concat conditioning
+        (passing y to WanModel.forward) is valid.
+
+        Initialization:
+        - first C channels: copy pretrained weights
+        - second C channels: zero init
+        """
+        patch = self.model.model.patch_embedding
+        old_in = int(patch.in_channels)
+        new_in = old_in * 2
+
+        # If already expanded, do nothing.
+        if old_in == new_in // 2 and patch.in_channels == new_in:
+            return
+        if old_in % 2 == 0 and patch.in_channels == old_in and old_in * 2 == new_in:
+            # proceed
+            pass
+
+        new_patch = nn.Conv3d(
+            in_channels=new_in,
+            out_channels=patch.out_channels,
+            kernel_size=patch.kernel_size,
+            stride=patch.stride,
+            padding=patch.padding,
+            dilation=patch.dilation,
+            groups=patch.groups,
+            bias=patch.bias is not None,
+            padding_mode=patch.padding_mode,
+            device=patch.weight.device,
+            dtype=patch.weight.dtype,
+        )
+
+        with torch.no_grad():
+            new_patch.weight.zero_()
+            new_patch.weight[:, :old_in].copy_(patch.weight)
+            if patch.bias is not None:
+                new_patch.bias.copy_(patch.bias)
+
+        self.model.model.patch_embedding = new_patch
+        logger.info(
+            "Expanded patch_embedding in_channels for concat conditioning: "
+            f"{old_in} -> {new_in} (new half zero-initialized)"
+        )
 
     def _ensure_noise_schedule(self):
         """
@@ -306,14 +364,8 @@ class LoRATrainer:
         return int(seq_len)
 
     def _supports_channel_concat_condition(self, latent_channels):
-        """
-        Returns True if the model's patch embedding expects channel-concatenated
-        source conditioning (i.e. in_channels == 2 * latent_channels).
-        """
         in_ch = int(self.model.model.patch_embedding.in_channels)
-        if in_ch == int(latent_channels) * 2:
-            return True
-        return False
+        return in_ch == int(latent_channels) * 2
 
     def _encode_video_batch_to_latents(self, video_btchw):
         """
@@ -344,6 +396,9 @@ class LoRATrainer:
             else:
                 context = self.model.text_encoder(prompts, torch.device('cpu'))
                 context = [t.to(self.device) for t in context]
+        # WanModel.text_embedding is float32 by default; enforce matching dtype
+        # to avoid matmul dtype mismatch (e.g., BF16 context vs FP32 weights).
+        context = [t.float() for t in context]
         return context
     
     def setup_data(self):
@@ -434,16 +489,20 @@ class LoRATrainer:
         if should_debug:
             self._debug(f"noise schedule ready in {(time.perf_counter() - t0):.3f}s")
 
-        # 1) Encode target videos to latent space.
+        # 1) Encode source and target videos to latent space.
         t1 = time.perf_counter()
+        source_latents = self._encode_video_batch_to_latents(source_video)
         target_latents = self._encode_video_batch_to_latents(edited_video)
         batch_size = len(target_latents)
-        source_latents = None
         use_source_concat = self._supports_channel_concat_condition(
             target_latents[0].shape[0]
         )
-        if use_source_concat:
-            source_latents = self._encode_video_batch_to_latents(source_video)
+        if not use_source_concat:
+            raise RuntimeError(
+                "Channel-concat conditioning requested but patch_embedding is not expanded "
+                f"(in_channels={self.model.model.patch_embedding.in_channels}, "
+                f"latent_channels={target_latents[0].shape[0]})."
+            )
         if should_debug:
             self._debug(
                 f"vae encode done in {(time.perf_counter() - t1):.3f}s | "
@@ -498,8 +557,7 @@ class LoRATrainer:
             context=context,
             seq_len=seq_len,
         )
-        if use_source_concat:
-            model_kwargs["y"] = source_latents
+        model_kwargs["y"] = source_latents
         eps_pred_list = self.model.model(noisy_latents, **model_kwargs)
         if should_debug:
             self._debug(
