@@ -1,0 +1,26 @@
+# Additional dependencies for LoRA training
+# Install with: pip install -r scripts/requirements_training.txt
+
+# Core training dependencies
+peft>=0.7.0
+accelerate>=0.25.0
+datasets>=2.16.0
+transformers>=4.36.0
+
+# Data processing
+opencv-python>=4.9.0
+pandas>=2.0.0
+pyyaml>=6.0
+
+# Monitoring and logging
+tensorboard>=2.15.0
+wandb>=0.16.0  # Optional, for experiment tracking
+
+# Evaluation metrics
+torchmetrics>=1.2.0
+lpips>=0.1.4  # Perceptual loss
+scikit-image>=0.22.0
+
+# Utilities
+tqdm>=4.66.0
+pillow>=10.0.0
