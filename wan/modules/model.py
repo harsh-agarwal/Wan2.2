@@ -443,6 +443,14 @@ class WanModel(ModelMixin, ConfigMixin):
 
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+        else:
+            # Compatibility path: if the input projection expects channel-concat
+            # conditioning (2C) but no y is provided, use zero-conditioning.
+            # This keeps inference/training callers that don't pass y from crashing.
+            expected_in = int(self.patch_embedding.in_channels)
+            current_in = int(x[0].shape[0])
+            if expected_in == current_in * 2:
+                x = [torch.cat([u, torch.zeros_like(u)], dim=0) for u in x]
 
         # embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
