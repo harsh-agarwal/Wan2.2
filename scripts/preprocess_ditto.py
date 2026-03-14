@@ -58,34 +58,45 @@ def load_metadata(metadata_dir):
 def filter_style_samples(samples, style_keywords=None):
     """
     Filter samples for style transfer tasks.
-    
+
+    Primary filter: edited_path must be under a global_style* folder (or mini_test_videos
+    for smoke-test mode). This is the reliable structural indicator that a sample is a
+    style-transfer pair — independent of how the instruction is worded.
+
+    Optional secondary filter: if style_keywords are explicitly provided (via --style_filter),
+    the instruction must also contain one of those keywords. This lets callers narrow to a
+    specific style (e.g. only 'anime'). When style_keywords is None (the default), all
+    structurally-valid style pairs are kept regardless of instruction wording.
+
     Args:
         samples: List of sample dictionaries
-        style_keywords: List of style keywords to filter for (e.g., ['anime', 'cyberpunk'])
+        style_keywords: If provided, only keep samples whose instruction contains one of
+                        these keywords. If None, keep all structural style-transfer samples.
     """
-    if style_keywords is None:
-        # Default: include all style transfer samples
-        style_keywords = [
-            'anime', 'cartoon', 'pixel art', 'cyberpunk', 'watercolor',
-            'oil painting', 'sketch', 'comic', 'neon', 'vintage',
-            'black and white', 'film noir', 'impressionist', 'abstract'
-        ]
-    
     print(f"\n🔍 Filtering for style transfer samples...")
-    print(f"   Style keywords: {style_keywords}")
-    
+    if style_keywords:
+        print(f"   Style keywords (instruction filter): {style_keywords}")
+    else:
+        print("   No keyword filter — keeping all global_style* pairs")
+
     style_samples = []
-    
+
     for sample in tqdm(samples, desc="Filtering"):
-        instruction = sample.get('instruction', '').lower()
-        
-        # Check if it's a style transfer instruction
-        if any(keyword in instruction for keyword in style_keywords):
-            # Keep style-transfer samples. In mini smoke mode, edited_path is mini_test_videos/*.
-            edited_path = sample.get('edited_path', '')
-            if 'global_style' in edited_path or 'mini_test_videos/' in edited_path:
-                style_samples.append(sample)
-    
+        edited_path = sample.get('edited_path', '')
+
+        # Primary: structural check — is this a style-transfer output?
+        is_style_pair = 'global_style' in edited_path or 'mini_test_videos/' in edited_path
+        if not is_style_pair:
+            continue
+
+        # Secondary (optional): narrow by instruction keywords
+        if style_keywords:
+            instruction = sample.get('instruction', '').lower()
+            if not any(kw in instruction for kw in style_keywords):
+                continue
+
+        style_samples.append(sample)
+
     print(f"✅ Found {len(style_samples)} style transfer samples")
     return style_samples
 
@@ -108,7 +119,6 @@ def create_train_val_split(samples, base_dir, val_ratio=0.1, verify_files=True):
         verify_files: If True, only include samples where files exist
     """
     print(f"\n📊 Creating train/val split (val_ratio={val_ratio})...")
-    
     # Filter samples with existing files if requested
     if verify_files:
         print("   Verifying video files exist...")
