@@ -20,6 +20,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as torch_ckpt
 import yaml
 from PIL import Image
 from torch.optim import AdamW
@@ -220,6 +221,7 @@ class LoRATrainer:
         self.debug_loss_steps = int(training_cfg.get('debug_loss_steps', 3))
         self.debug_breakpoint = bool(training_cfg.get('debug_breakpoint', False))
         self._debug_loss_seen = 0
+        self.memory_debug = bool(training_cfg.get('memory_debug', False))
         
         # Create output directories
         self.output_dir = Path(config['training']['output_dir'])
@@ -240,15 +242,35 @@ class LoRATrainer:
     def _debug(self, msg):
         if self.debug_loss:
             logger.info(f"[DEBUG_LOSS] {msg}")
+
+    def _mem(self, tag):
+        """Log GPU memory at a named checkpoint. Only active when memory_debug=true."""
+        if not self.memory_debug:
+            return
+        torch.cuda.synchronize()
+        alloc  = torch.cuda.memory_allocated()  / 1024**3
+        reserv = torch.cuda.memory_reserved()   / 1024**3
+        peak   = torch.cuda.max_memory_allocated() / 1024**3
+        total  = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        logger.info(
+            f"[MEM] {tag:<45s} "
+            f"alloc={alloc:6.2f}GB  reserved={reserv:6.2f}GB  "
+            f"peak={peak:6.2f}GB  total={total:.2f}GB"
+        )
+
+    def _mem_reset_peak(self):
+        if self.memory_debug:
+            torch.cuda.reset_peak_memory_stats()
     
     def setup_model(self):
         """Initialize Wan2.2 model with LoRA."""
         logger.info("Setting up Wan2.2 model...")
-        
+        self._mem("before model load")
+
         # Load base model config
         task = self.config['model']['task']
         wan_config = WAN_CONFIGS[task]
-        
+
         # Initialize model
         self.model = WanTI2V(
             config=wan_config,
@@ -262,6 +284,8 @@ class LoRATrainer:
             init_on_cpu=False,
             convert_model_dtype=self.config['inference']['convert_model_dtype']
         )
+
+        self._mem("after WanTI2V init (DiT + T5 + VAE loaded)")
 
         # Expand input projection for channel-concat conditioning:
         # x and y are concatenated along channels in WanModel.forward when y is passed.
@@ -292,8 +316,40 @@ class LoRATrainer:
         for p in base_model.patch_embedding.parameters():
             p.requires_grad = True
 
+        self._mem("after LoRA applied")
+
+        # ---- Gradient checkpointing ----
+        # The DiT has 30 transformer blocks.  Without checkpointing every
+        # block's activations stay in VRAM for the backward pass (~2-3 GB each),
+        # easily exceeding 80 GB.  With checkpointing we trade one extra forward
+        # pass per block for freeing those activations — typically cuts peak VRAM
+        # by ~50-60 %.
+        if self.config['training'].get('gradient_checkpointing', False):
+            dit = self.model.model.get_base_model()
+            for block in dit.blocks:
+                block._original_forward = block.forward
+
+                def _make_ckpt_forward(mod):
+                    def _ckpt_forward(*args, **kwargs):
+                        # torch.utils.checkpoint does not natively support kwargs,
+                        # so we wrap them into a closure.
+                        def run(*a):
+                            return mod._original_forward(*a, **kwargs)
+                        return torch_ckpt.checkpoint(run, *args, use_reentrant=False)
+                    return _ckpt_forward
+
+                block.forward = _make_ckpt_forward(block)
+            logger.info(
+                f"Gradient checkpointing enabled for {len(dit.blocks)} DiT blocks"
+            )
+        else:
+            logger.warning(
+                "Gradient checkpointing is DISABLED — expect high VRAM usage. "
+                "Set training.gradient_checkpointing=true if you hit OOM."
+            )
+
         self.model.model.print_trainable_parameters()
-        
+
         # Print trainable parameters
         trainable_params = sum(p.numel() for p in self.model.model.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in self.model.model.parameters())
@@ -389,11 +445,66 @@ class LoRATrainer:
                 latents.append(z.to(self.device, dtype=torch.float32))
         return latents
 
+    def _encode_text_single(self, prompt: str):
+        """
+        Encode one prompt string → context tensor on CPU (float32).
+        Called only by _build_text_cache; never called per-step.
+        """
+        with torch.no_grad():
+            if not self.model.t5_cpu:
+                self.model.text_encoder.model.to(self.device)
+                ctx = self.model.text_encoder([prompt], self.device)
+                ctx = [t.cpu().float() for t in ctx]
+            else:
+                ctx = self.model.text_encoder([prompt], torch.device('cpu'))
+                ctx = [t.float() for t in ctx]
+        return ctx[0]  # single tensor [seq_len, 4096]
+
+    def _build_text_cache(self, datasets):
+        """
+        Pre-encode every unique instruction string that appears in the given
+        datasets.  Results are kept on CPU and moved to GPU per-step, so the
+        T5 model itself is never called during training.
+
+        In the mini dataset all samples share one instruction, so this runs
+        T5 exactly once.  In medium/full datasets the number of unique
+        instructions is still small relative to the number of training steps.
+        """
+        unique_prompts = set()
+        for ds in datasets:
+            for sample in ds.samples:
+                unique_prompts.add(sample['instruction'])
+
+        logger.info(
+            f"Pre-encoding {len(unique_prompts)} unique instruction(s) with T5 "
+            f"(runs once — cached for all training steps)..."
+        )
+        self._text_cache = {}
+        for i, prompt in enumerate(sorted(unique_prompts)):
+            self._text_cache[prompt] = self._encode_text_single(prompt)
+            logger.info(f"  [{i+1}/{len(unique_prompts)}] cached: '{prompt[:80]}'")
+
+        logger.info("T5 cache built. T5 will not run again during training.")
+
     def _encode_text(self, prompts):
         """
         prompts: list[str]
-        returns context list for WanModel forward.
+        returns context list for WanModel forward (tensors on GPU, float32).
+
+        Serves from _text_cache if available (built once before training),
+        otherwise falls back to live T5 inference (e.g. during preview generation).
         """
+        if hasattr(self, '_text_cache'):
+            context = []
+            for p in prompts:
+                if p not in self._text_cache:
+                    # Unseen prompt at inference time — encode and cache it
+                    logger.warning(f"Cache miss for prompt '{p[:60]}' — encoding now")
+                    self._text_cache[p] = self._encode_text_single(p)
+                context.append(self._text_cache[p].to(self.device).float())
+            return context
+
+        # Fallback: live T5 inference (only hit before _build_text_cache is called)
         with torch.no_grad():
             if not self.model.t5_cpu:
                 self.model.text_encoder.model.to(self.device)
@@ -401,8 +512,6 @@ class LoRATrainer:
             else:
                 context = self.model.text_encoder(prompts, torch.device('cpu'))
                 context = [t.to(self.device) for t in context]
-        # WanModel.text_embedding is float32 by default; enforce matching dtype
-        # to avoid matmul dtype mismatch (e.g., BF16 context vs FP32 weights).
         context = [t.float() for t in context]
         return context
     
@@ -427,7 +536,10 @@ class LoRATrainer:
             resolution=tuple(data_config['resolution'])
         )
         self.val_dataset = val_dataset
-        
+
+        # Pre-encode all unique instructions once so T5 is never called per-step
+        self._build_text_cache([train_dataset, val_dataset])
+
         # Create data loaders
         train_num_workers = int(self.config['training'].get('num_workers', 0))
         val_num_workers = int(self.config['training'].get('val_num_workers', train_num_workers))
@@ -593,9 +705,16 @@ class LoRATrainer:
             self._debug(f"noise schedule ready in {(time.perf_counter() - t0):.3f}s")
 
         # 1) Encode source and target videos to latent space.
+        self._mem("compute_loss start")
         t1 = time.perf_counter()
         source_latents = self._encode_video_batch_to_latents(source_video)
+        self._mem("after source VAE encode")
         target_latents = self._encode_video_batch_to_latents(edited_video)
+        self._mem("after target VAE encode")
+        # Free the raw video tensors — latents are all we need from here on.
+        del source_video, edited_video
+        torch.cuda.empty_cache()
+        self._mem("after del videos + empty_cache")
         batch_size = len(target_latents)
         use_source_concat = self._supports_channel_concat_condition(
             target_latents[0].shape[0]
@@ -617,9 +736,8 @@ class LoRATrainer:
         # 2) Text conditioning.
         t2 = time.perf_counter()
         prompts = list(instruction)
-        # If source-caption exists in future dataset variants, concatenate it here
-        # for stronger semantic conditioning when pixel concat is unavailable.
         context = self._encode_text(prompts)
+        self._mem("after T5 text encode")
         if should_debug:
             self._debug(f"text encode done in {(time.perf_counter() - t2):.3f}s | prompts={len(prompts)}")
 
@@ -648,6 +766,7 @@ class LoRATrainer:
             eps_targets.append(eps)
         if should_debug:
             self._debug(f"forward diffusion build in {(time.perf_counter() - t4):.3f}s")
+        self._mem("after noise build (noisy_latents ready)")
 
         # WanModel supports t as [B]; it internally expands to [B, seq_len].
         seq_len = self._compute_seq_len_from_latent(target_latents[0])
@@ -655,13 +774,21 @@ class LoRATrainer:
 
         # 5) Predict epsilon, conditioned on source latents + text instruction.
         t5 = time.perf_counter()
+        # Cast inputs to match the model's parameter dtype (e.g. bfloat16 when
+        # convert_model_dtype=True). Latents are kept float32 elsewhere for
+        # numerical stability; the cast happens only for the DiT forward pass.
+        model_dtype = next(self.model.model.parameters()).dtype
+        noisy_latents_model = [x.to(dtype=model_dtype) for x in noisy_latents]
+        source_latents_model = [x.to(dtype=model_dtype) for x in source_latents]
         model_kwargs = dict(
             t=t_for_model,
             context=context,
             seq_len=seq_len,
         )
-        model_kwargs["y"] = source_latents
-        eps_pred_list = self.model.model(noisy_latents, **model_kwargs)
+        model_kwargs["y"] = source_latents_model
+        self._mem("before DiT forward")
+        eps_pred_list = self.model.model(noisy_latents_model, **model_kwargs)
+        self._mem("after DiT forward")
         if should_debug:
             self._debug(
                 f"model forward in {(time.perf_counter() - t5):.3f}s | seq_len={seq_len} "
@@ -674,6 +801,7 @@ class LoRATrainer:
         for eps_pred, eps_tgt in zip(eps_pred_list, eps_targets):
             loss = loss + F.mse_loss(eps_pred.float(), eps_tgt.float())
         loss = loss / batch_size
+        self._mem("after loss compute")
         if should_debug:
             self._debug(
                 f"loss reduce in {(time.perf_counter() - t6):.3f}s | "
@@ -695,17 +823,24 @@ class LoRATrainer:
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}")
         
         for step, batch in enumerate(progress_bar):
-            # Move to device
-            source_video = batch['source_video'].to(self.device)
-            edited_video = batch['edited_video'].to(self.device)
+            # Keep videos on CPU — _encode_video_batch_to_latents moves one
+            # sample at a time, so there's no need to hold the full [B,T,C,H,W]
+            # tensor on GPU throughout the forward pass.
+            source_video = batch['source_video']
+            edited_video = batch['edited_video']
             instruction = batch['instruction']
-            
+
+            # Reset peak stats each step so peak reflects THIS step only
+            self._mem_reset_peak()
+
             # Forward pass
             loss = self.compute_loss(source_video, edited_video, instruction)
-            
+
             # Backward pass
+            self._mem("before backward")
             loss.backward()
-            
+            self._mem("after backward")
+
             # Gradient accumulation
             if (step + 1) % self.config['training']['gradient_accumulation_steps'] == 0:
                 # Clip gradients
@@ -713,9 +848,9 @@ class LoRATrainer:
                     self.model.model.parameters(),
                     self.config['training']['max_grad_norm']
                 )
-                
                 optimizer.step()
                 optimizer.zero_grad()
+                self._mem("after optimizer step")
             
             # Logging
             total_loss += loss.item()
@@ -827,7 +962,49 @@ def load_config(config_path):
     return config
 
 
+def validate_data_paths(config):
+    """
+    Ensure all data paths point to /mnt/localssd and actually exist.
+    Fails fast before any model loading so the error is immediately obvious.
+    """
+    DATA_ROOT = "/mnt/localssd"
+    data_cfg = config.get('data', {})
+    checks = {
+        'data_dir':       data_cfg.get('data_dir', ''),
+        'train_metadata': data_cfg.get('train_metadata', ''),
+        'val_metadata':   data_cfg.get('val_metadata', ''),
+    }
+
+    errors = []
+    for key, path in checks.items():
+        if not path:
+            errors.append(f"  - data.{key} is not set in config")
+            continue
+        if not path.startswith(DATA_ROOT):
+            errors.append(
+                f"  - data.{key} = '{path}'\n"
+                f"    Expected path under {DATA_ROOT}/ (not the repo ./data/ folder)"
+            )
+        elif not Path(path).exists():
+            errors.append(
+                f"  - data.{key} = '{path}'\n"
+                f"    Path does not exist — run the download/preprocess scripts first"
+            )
+
+    if errors:
+        logger.error(
+            "❌ Data path validation failed:\n" + "\n".join(errors) + "\n\n"
+            "  Fix: update your config so all data.* paths point to "
+            f"{DATA_ROOT}/datasets/ and re-run the download script."
+        )
+        raise SystemExit(1)
+
+
 def main():
+    # Reduce CUDA allocator fragmentation — helps when many tensors of varying
+    # sizes are allocated/freed (e.g. per-layer activations during grad ckpt).
+    os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
     parser = argparse.ArgumentParser(
         description="Train LoRA for Wan2.2 style transfer"
     )
@@ -848,7 +1025,8 @@ def main():
     
     # Load config
     config = load_config(args.config)
-    
+    validate_data_paths(config)
+
     # Check CUDA
     if not torch.cuda.is_available():
         logger.error("❌ CUDA not available! Training requires GPU.")
