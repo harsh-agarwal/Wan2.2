@@ -7,6 +7,7 @@ to learn style transfer from the Ditto-1M dataset.
 """
 
 import argparse
+import contextlib
 import json
 import logging
 import os
@@ -18,6 +19,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as torch_ckpt
@@ -25,8 +27,17 @@ import yaml
 from PIL import Image
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    MixedPrecision,
+    ShardingStrategy,
+    FullStateDictConfig,
+    StateDictType,
+)
+from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
+from functools import partial
 from tqdm import tqdm
 
 # Add parent directory to path
@@ -213,30 +224,39 @@ class DittoStyleDataset(Dataset):
 class LoRATrainer:
     """Trainer for LoRA fine-tuning on Wan2.2."""
     
-    def __init__(self, config):
+    def __init__(self, config, rank=0, world_size=1, local_rank=0):
         self.config = config
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.rank = rank
+        self.world_size = world_size
+        self.local_rank = local_rank
+        self.is_main = (rank == 0)
+        # Each rank owns its assigned GPU.
+        self.device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(self.device)
+
         training_cfg = config.get('training', {})
         self.debug_loss = bool(training_cfg.get('debug_loss', False))
         self.debug_loss_steps = int(training_cfg.get('debug_loss_steps', 3))
         self.debug_breakpoint = bool(training_cfg.get('debug_breakpoint', False))
         self._debug_loss_seen = 0
         self.memory_debug = bool(training_cfg.get('memory_debug', False))
-        
-        # Create output directories
+        # Whether to use FSDP (set when torchrun provides RANK env var and config enables it)
+        self.use_fsdp = world_size > 1 and bool(training_cfg.get('fsdp', False))
+
+        # Create output directories and TensorBoard writer on rank 0 only.
         self.output_dir = Path(config['training']['output_dir'])
         self.logging_dir = Path(config['training']['logging_dir'])
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.logging_dir.mkdir(parents=True, exist_ok=True)
-        self.writer = SummaryWriter(log_dir=str(self.logging_dir))
+        if self.is_main:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            self.logging_dir.mkdir(parents=True, exist_ok=True)
+            self.writer = SummaryWriter(log_dir=str(self.logging_dir))
+            with open(self.output_dir / "config.yaml", 'w') as f:
+                yaml.dump(config, f)
+            logger.info(f"Output directory: {self.output_dir}")
+            logger.info(f"Logging directory: {self.logging_dir}")
+        else:
+            self.writer = None  # non-rank-0 processes never write to TB
         self.global_step = 0
-        
-        # Save config
-        with open(self.output_dir / "config.yaml", 'w') as f:
-            yaml.dump(config, f)
-        
-        logger.info(f"Output directory: {self.output_dir}")
-        logger.info(f"Logging directory: {self.logging_dir}")
         self._noise_schedule_ready = False
 
     def _debug(self, msg):
@@ -251,9 +271,9 @@ class LoRATrainer:
         alloc  = torch.cuda.memory_allocated()  / 1024**3
         reserv = torch.cuda.memory_reserved()   / 1024**3
         peak   = torch.cuda.max_memory_allocated() / 1024**3
-        total  = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        total  = torch.cuda.get_device_properties(self.local_rank).total_memory / 1024**3
         logger.info(
-            f"[MEM] {tag:<45s} "
+            f"[MEM][rank{self.rank}] {tag:<45s} "
             f"alloc={alloc:6.2f}GB  reserved={reserv:6.2f}GB  "
             f"peak={peak:6.2f}GB  total={total:.2f}GB"
         )
@@ -271,12 +291,12 @@ class LoRATrainer:
         task = self.config['model']['task']
         wan_config = WAN_CONFIGS[task]
 
-        # Initialize model
+        # Initialize model — each rank loads to its own GPU.
         self.model = WanTI2V(
             config=wan_config,
             checkpoint_dir=self.config['model']['base_model_path'],
-            device_id=0,
-            rank=0,
+            device_id=self.local_rank,
+            rank=self.rank,
             t5_fsdp=False,
             dit_fsdp=False,
             use_sp=False,
@@ -318,43 +338,106 @@ class LoRATrainer:
 
         self._mem("after LoRA applied")
 
-        # ---- Gradient checkpointing ----
-        # The DiT has 30 transformer blocks.  Without checkpointing every
-        # block's activations stay in VRAM for the backward pass (~2-3 GB each),
-        # easily exceeding 80 GB.  With checkpointing we trade one extra forward
-        # pass per block for freeing those activations — typically cuts peak VRAM
-        # by ~50-60 %.
-        if self.config['training'].get('gradient_checkpointing', False):
-            dit = self.model.model.get_base_model()
-            for block in dit.blocks:
-                block._original_forward = block.forward
-
-                def _make_ckpt_forward(mod):
-                    def _ckpt_forward(*args, **kwargs):
-                        # torch.utils.checkpoint does not natively support kwargs,
-                        # so we wrap them into a closure.
-                        def run(*a):
-                            return mod._original_forward(*a, **kwargs)
-                        return torch_ckpt.checkpoint(run, *args, use_reentrant=False)
-                    return _ckpt_forward
-
-                block.forward = _make_ckpt_forward(block)
-            logger.info(
-                f"Gradient checkpointing enabled for {len(dit.blocks)} DiT blocks"
+        # ── FSDP wrapping ────────────────────────────────────────────────────
+        # Must happen BEFORE gradient checkpointing when using FSDP.
+        # Applying grad-ckpt first via manual block.forward patching causes a
+        # dtype mismatch: torch.utils.checkpoint recomputes outside FSDP's
+        # forward hook, so FSDP's MixedPrecision cast (float32→bfloat16) is
+        # not re-applied during recompute — weights are bfloat16 but activations
+        # are still float32 → RuntimeError in the LoRA linear layers.
+        if self.use_fsdp:
+            sharding_str = self.config['training'].get('fsdp_sharding_strategy', 'FULL_SHARD')
+            sharding_strategy = getattr(ShardingStrategy, sharding_str)
+            base_model = self.model.model.get_base_model()
+            fsdp_policy = partial(
+                lambda_auto_wrap_policy,
+                lambda_fn=lambda m: m in base_model.blocks,
             )
+            self.model.model = FSDP(
+                self.model.model,
+                sharding_strategy=sharding_strategy,
+                auto_wrap_policy=fsdp_policy,
+                # No param_dtype: keep weights in float32 so FSDP doesn't fight
+                # the model's own internal dtype contracts (WanAttentionBlock has
+                # explicit `assert e.dtype == float32` and `.float()` casts that
+                # break when param_dtype=bfloat16 + cast_forward_inputs=True).
+                # Mixed-precision compute is handled via torch.autocast in
+                # compute_loss instead, which respects the model's internal casts.
+                # reduce_dtype=bfloat16 keeps gradient all-reduce efficient.
+                mixed_precision=MixedPrecision(
+                    param_dtype=None,
+                    reduce_dtype=torch.bfloat16,
+                    buffer_dtype=torch.float32,
+                ),
+                device_id=self.local_rank,
+                sync_module_states=True,   # broadcast rank-0 weights to all ranks
+                use_orig_params=True,      # required for LoRA / PEFT save_pretrained
+            )
+            logger.info(
+                f"[rank{self.rank}] FSDP wrapping done "
+                f"(strategy={sharding_str}, world_size={self.world_size})"
+            )
+
+        # ── Gradient checkpointing ───────────────────────────────────────────
+        # The DiT has 30 transformer blocks. Without checkpointing, every
+        # block's activations stay in VRAM for the backward pass (~2-3 GB each).
+        # With checkpointing we trade one extra forward pass per block for
+        # freeing those activations — typically cuts peak VRAM by ~50-60%.
+        #
+        # FSDP path: use apply_activation_checkpointing AFTER FSDP wrapping.
+        #   This uses CheckpointWrapper which re-enters FSDP's forward context
+        #   during recompute, ensuring parameters are re-gathered and re-cast to
+        #   bfloat16 before the recomputed forward runs.
+        #
+        # Single-GPU path: manual block.forward patching (unchanged behaviour).
+        if self.config['training'].get('gradient_checkpointing', False):
+            if self.use_fsdp:
+                from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+                    apply_activation_checkpointing,
+                    checkpoint_wrapper,
+                    CheckpointImpl,
+                )
+                from wan.modules.model import WanAttentionBlock
+                apply_activation_checkpointing(
+                    self.model.model,
+                    checkpoint_wrapper_fn=partial(
+                        checkpoint_wrapper,
+                        checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+                    ),
+                    check_fn=lambda m: isinstance(m, WanAttentionBlock),
+                )
+                logger.info(
+                    "Gradient checkpointing enabled via apply_activation_checkpointing "
+                    "(FSDP-safe, NO_REENTRANT)"
+                )
+            else:
+                dit = self.model.model.get_base_model()
+                for block in dit.blocks:
+                    block._original_forward = block.forward
+
+                    def _make_ckpt_forward(mod):
+                        def _ckpt_forward(*args, **kwargs):
+                            def run(*a):
+                                return mod._original_forward(*a, **kwargs)
+                            return torch_ckpt.checkpoint(run, *args, use_reentrant=False)
+                        return _ckpt_forward
+
+                    block.forward = _make_ckpt_forward(block)
+                logger.info(
+                    f"Gradient checkpointing enabled for {len(dit.blocks)} DiT blocks"
+                )
         else:
             logger.warning(
                 "Gradient checkpointing is DISABLED — expect high VRAM usage. "
                 "Set training.gradient_checkpointing=true if you hit OOM."
             )
 
-        self.model.model.print_trainable_parameters()
-
-        # Print trainable parameters
+        if self.is_main:
+            self.model.model.print_trainable_parameters()
         trainable_params = sum(p.numel() for p in self.model.model.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in self.model.model.parameters())
-        logger.info(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({100 * trainable_params / total_params:.2f}%)")
-        
+        logger.info(f"[rank{self.rank}] Trainable parameters: {trainable_params:,} / {total_params:,} ({100 * trainable_params / total_params:.2f}%)")
+
         return self.model
 
     def _expand_patch_embedding_for_concat_condition(self):
@@ -543,21 +626,50 @@ class LoRATrainer:
         # Create data loaders
         train_num_workers = int(self.config['training'].get('num_workers', 0))
         val_num_workers = int(self.config['training'].get('val_num_workers', train_num_workers))
+
+        # DistributedSampler ensures each rank sees a disjoint subset of samples.
+        # shuffle=False on the loader because the sampler handles shuffling.
+        if self.use_fsdp:
+            train_sampler = DistributedSampler(
+                train_dataset,
+                num_replicas=self.world_size,
+                rank=self.rank,
+                shuffle=True,
+                drop_last=True,
+            )
+            val_sampler = DistributedSampler(
+                val_dataset,
+                num_replicas=self.world_size,
+                rank=self.rank,
+                shuffle=False,
+                drop_last=False,
+            )
+            train_shuffle = False
+        else:
+            train_sampler = None
+            val_sampler = None
+            train_shuffle = True
+
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.config['training']['batch_size'],
-            shuffle=True,
+            shuffle=train_shuffle,
+            sampler=train_sampler,
             num_workers=train_num_workers,
-            pin_memory=True
+            pin_memory=True,
         )
-        
+
         val_loader = DataLoader(
             val_dataset,
             batch_size=self.config['training']['batch_size'],
             shuffle=False,
+            sampler=val_sampler,
             num_workers=val_num_workers,
-            pin_memory=True
+            pin_memory=True,
         )
+
+        # Store sampler so train_epoch can call set_epoch for proper shuffling.
+        self.train_sampler = train_sampler
         
         logger.info(f"Train samples: {len(train_dataset)}")
         logger.info(f"Val samples: {len(val_dataset)}")
@@ -624,6 +736,13 @@ class LoRATrainer:
         preview_dir = self.output_dir / "val_previews" / f"epoch_{epoch + 1:03d}"
         preview_dir.mkdir(parents=True, exist_ok=True)
 
+        # Preview generation only runs on rank 0 — it calls model.generate which
+        # is not distributed-aware. Non-rank-0 processes wait at a barrier.
+        if not self.is_main:
+            if self.use_fsdp:
+                dist.barrier()
+            return
+
         logger.info(f"Generating {preview_n} val previews for epoch {epoch + 1} ...")
         was_training = self.model.model.training
         self.model.model.eval()
@@ -660,6 +779,10 @@ class LoRATrainer:
             logger.info(f"Saved {len(saved_files)} val previews to {preview_dir}")
             for i, (path, vid_tensor) in enumerate(zip(saved_files, preview_tensors)):
                 self._log_video_to_tensorboard(f"val/preview_{i:02d}", vid_tensor, epoch)
+
+        # Release the barrier so other ranks can proceed.
+        if self.use_fsdp:
+            dist.barrier()
     
     def setup_optimizer(self):
         """Setup optimizer and scheduler."""
@@ -774,12 +897,12 @@ class LoRATrainer:
 
         # 5) Predict epsilon, conditioned on source latents + text instruction.
         t5 = time.perf_counter()
-        # Cast inputs to match the model's parameter dtype (e.g. bfloat16 when
-        # convert_model_dtype=True). Latents are kept float32 elsewhere for
-        # numerical stability; the cast happens only for the DiT forward pass.
+        # Cast inputs to match model parameter dtype (float32 for both FSDP and
+        # single-GPU paths — FSDP no longer uses param_dtype=bfloat16).
         model_dtype = next(self.model.model.parameters()).dtype
         noisy_latents_model = [x.to(dtype=model_dtype) for x in noisy_latents]
         source_latents_model = [x.to(dtype=model_dtype) for x in source_latents]
+        context = [c.to(dtype=model_dtype) for c in context]
         model_kwargs = dict(
             t=t_for_model,
             context=context,
@@ -787,7 +910,17 @@ class LoRATrainer:
         )
         model_kwargs["y"] = source_latents_model
         self._mem("before DiT forward")
-        eps_pred_list = self.model.model(noisy_latents_model, **model_kwargs)
+        # torch.autocast lets linear layers (including LoRA) compute in bfloat16
+        # while the model's own internal float32 assertions and .float() casts
+        # remain respected — autocast only promotes ops that are safe to run in
+        # lower precision, and explicit .float() casts inside the model override it.
+        autocast_ctx = (
+            torch.autocast('cuda', dtype=torch.bfloat16)
+            if self.use_fsdp
+            else contextlib.nullcontext()
+        )
+        with autocast_ctx:
+            eps_pred_list = self.model.model(noisy_latents_model, **model_kwargs)
         self._mem("after DiT forward")
         if should_debug:
             self._debug(
@@ -817,11 +950,15 @@ class LoRATrainer:
     
     def train_epoch(self, train_loader, optimizer, epoch):
         """Train for one epoch."""
+        # DistributedSampler must know the epoch for correct per-epoch shuffling.
+        if self.use_fsdp and self.train_sampler is not None:
+            self.train_sampler.set_epoch(epoch)
+
         self.model.model.train()
-        
+
         total_loss = 0
-        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}")
-        
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}", disable=not self.is_main)
+
         for step, batch in enumerate(progress_bar):
             # Keep videos on CPU — _encode_video_batch_to_latents moves one
             # sample at a time, so there's no need to hold the full [B,T,C,H,W]
@@ -843,62 +980,117 @@ class LoRATrainer:
 
             # Gradient accumulation
             if (step + 1) % self.config['training']['gradient_accumulation_steps'] == 0:
-                # Clip gradients
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.model.parameters(),
-                    self.config['training']['max_grad_norm']
-                )
+                # With FSDP, clip_grad_norm_ must be called on the FSDP module
+                # itself so it can access sharded parameters across all ranks.
+                if self.use_fsdp:
+                    self.model.model.clip_grad_norm_(
+                        self.config['training']['max_grad_norm']
+                    )
+                else:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.model.parameters(),
+                        self.config['training']['max_grad_norm']
+                    )
                 optimizer.step()
                 optimizer.zero_grad()
                 self._mem("after optimizer step")
-            
-            # Logging
+
+            # Logging — only rank 0 writes to TensorBoard.
             total_loss += loss.item()
-            progress_bar.set_postfix({'loss': loss.item()})
-            self.writer.add_scalar("train/loss_step", loss.item(), self.global_step)
-            self.writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], self.global_step)
+            if self.is_main:
+                progress_bar.set_postfix({'loss': loss.item()})
+                self.writer.add_scalar("train/loss_step", loss.item(), self.global_step)
+                self.writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], self.global_step)
             self.global_step += 1
-            
-            # Save checkpoint
+
+            # Save checkpoint (rank 0 does the actual writing; all ranks must
+            # participate in FSDP state-dict gathering regardless).
             if (step + 1) % self.config['training']['save_steps'] == 0:
                 self.save_checkpoint(epoch, step)
-        
+
         avg_loss = total_loss / len(train_loader)
-        logger.info(f"Epoch {epoch} - Average loss: {avg_loss:.4f}")
-        self.writer.add_scalar("train/loss_epoch", avg_loss, epoch)
-        
+        logger.info(f"[rank{self.rank}] Epoch {epoch} - Average loss: {avg_loss:.4f}")
+        if self.is_main:
+            self.writer.add_scalar("train/loss_epoch", avg_loss, epoch)
+
         return avg_loss
     
     def validate(self, val_loader):
         """Run validation."""
         self.model.model.eval()
-        
-        total_loss = 0
-        
+
+        total_loss = 0.0
+        num_batches = 0
+
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc="Validation"):
-                source_video = batch['source_video'].to(self.device)
-                edited_video = batch['edited_video'].to(self.device)
+            for batch in tqdm(val_loader, desc="Validation", disable=not self.is_main):
+                source_video = batch['source_video']
+                edited_video = batch['edited_video']
                 instruction = batch['instruction']
-                
+
                 loss = self.compute_loss(source_video, edited_video, instruction)
                 total_loss += loss.item()
-        
-        avg_loss = total_loss / len(val_loader)
-        logger.info(f"Validation loss: {avg_loss:.4f}")
-        self.writer.add_scalar("val/loss_epoch", avg_loss, self.current_epoch)
-        
+                num_batches += 1
+
+        # Average across ranks so the reported loss is the global average.
+        if self.use_fsdp:
+            loss_tensor = torch.tensor([total_loss, float(num_batches)], device=self.device)
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            avg_loss = (loss_tensor[0] / loss_tensor[1]).item()
+        else:
+            avg_loss = total_loss / max(num_batches, 1)
+
+        if self.is_main:
+            logger.info(f"Validation loss: {avg_loss:.4f}")
+            self.writer.add_scalar("val/loss_epoch", avg_loss, self.current_epoch)
+
         return avg_loss
     
     def save_checkpoint(self, epoch, step):
-        """Save model checkpoint."""
+        """Save model checkpoint.
+
+        With FSDP all ranks must participate in state_dict gathering (it's a
+        collective operation), but only rank 0 writes the files to disk.
+        """
         checkpoint_path = self.output_dir / f"checkpoint-epoch{epoch}-step{step}"
-        checkpoint_path.mkdir(exist_ok=True)
-        
-        # Save LoRA weights
-        self.model.model.save_pretrained(checkpoint_path)
-        
-        logger.info(f"💾 Saved checkpoint to {checkpoint_path}")
+
+        if self.use_fsdp:
+            # FullStateDictConfig with rank0_only=True gathers all shards onto
+            # rank-0 CPU; other ranks receive an empty dict.
+            save_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(
+                self.model.model,
+                StateDictType.FULL_STATE_DICT,
+                save_cfg,
+            ):
+                full_state = self.model.model.state_dict()
+
+            if self.is_main:
+                checkpoint_path.mkdir(parents=True, exist_ok=True)
+                # Persist only LoRA / modules_to_save parameters to keep the
+                # checkpoint small; the frozen base weights are not needed.
+                lora_state = {
+                    k: v for k, v in full_state.items()
+                    if 'lora_' in k or 'modules_to_save' in k
+                }
+                torch.save(lora_state, checkpoint_path / "adapter_model.bin")
+                # Also copy the PEFT adapter config so the checkpoint is
+                # loadable with load_adapter / from_pretrained.
+                try:
+                    self.model.model._peft_config  # attribute exists on PeftModel
+                    import json as _json
+                    for adapter_name, peft_cfg in self.model.model.peft_config.items():
+                        cfg_dict = peft_cfg.to_dict()
+                        with open(checkpoint_path / "adapter_config.json", 'w') as f:
+                            _json.dump(cfg_dict, f, indent=2)
+                except Exception:
+                    pass
+                logger.info(f"[rank0] 💾 Saved FSDP checkpoint to {checkpoint_path}")
+        else:
+            if self.is_main:
+                checkpoint_path.mkdir(parents=True, exist_ok=True)
+                self.model.model.save_pretrained(checkpoint_path)
+                logger.info(f"💾 Saved checkpoint to {checkpoint_path}")
     
     def train(self):
         """Main training loop."""
@@ -947,12 +1139,12 @@ class LoRATrainer:
             if (epoch + 1) % 5 == 0:
                 self.save_checkpoint(epoch, "latest")
         
-        # Save final model
-        final_path = self.output_dir / "final"
-        self.model.model.save_pretrained(final_path)
-        logger.info(f"\n✅ Training complete! Final model saved to {final_path}")
-        self.writer.flush()
-        self.writer.close()
+        # Save final model — reuse save_checkpoint logic.
+        self.save_checkpoint("final", "last")
+        logger.info(f"\n✅ Training complete! Final model saved under {self.output_dir / 'checkpoint-epochfinal-steplast'}")
+        if self.is_main:
+            self.writer.flush()
+            self.writer.close()
 
 
 def load_config(config_path):
@@ -1020,26 +1212,53 @@ def main():
         default=None,
         help="Path to checkpoint to resume from"
     )
-    
+
     args = parser.parse_args()
-    
-    # Load config
+
+    # ── Distributed init ─────────────────────────────────────────────────────
+    # torchrun sets RANK / LOCAL_RANK / WORLD_SIZE automatically.
+    # When launched with plain `python` these vars are absent → single-GPU mode.
+    is_distributed = 'RANK' in os.environ and int(os.environ.get('WORLD_SIZE', 1)) > 1
+    if is_distributed:
+        dist.init_process_group(backend='nccl')
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ['LOCAL_RANK'])
+    else:
+        rank = 0
+        world_size = 1
+        local_rank = 0
+
+    torch.cuda.set_device(local_rank)
+
+    # Load config — all ranks load independently (cheap, avoids a broadcast).
     config = load_config(args.config)
-    validate_data_paths(config)
+
+    # Data-path validation only on rank 0 to avoid duplicate error spam.
+    if rank == 0:
+        validate_data_paths(config)
+    if is_distributed:
+        dist.barrier()  # wait for rank-0 validation before proceeding
 
     # Check CUDA
     if not torch.cuda.is_available():
         logger.error("❌ CUDA not available! Training requires GPU.")
+        if is_distributed:
+            dist.destroy_process_group()
         return
-    
-    logger.info(f"🎮 Using device: {torch.cuda.get_device_name(0)}")
-    logger.info(f"💾 GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-    
-    # Create trainer
-    trainer = LoRATrainer(config)
-    
-    # Start training
+
+    if rank == 0:
+        logger.info(f"🎮 Using device: {torch.cuda.get_device_name(local_rank)}")
+        logger.info(f"💾 GPU Memory: {torch.cuda.get_device_properties(local_rank).total_memory / 1e9:.2f} GB")
+        if is_distributed:
+            logger.info(f"🌐 Distributed: {world_size} GPUs, FSDP={'enabled' if config.get('training', {}).get('fsdp') else 'disabled'}")
+
+    # Create trainer and start training
+    trainer = LoRATrainer(config, rank=rank, world_size=world_size, local_rank=local_rank)
     trainer.train()
+
+    if is_distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
