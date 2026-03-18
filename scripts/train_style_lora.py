@@ -257,7 +257,7 @@ class LoRATrainer:
         else:
             self.writer = None  # non-rank-0 processes never write to TB
         self.global_step = 0
-        self._noise_schedule_ready = False
+        self._num_train_timesteps = None  # set lazily from model config
 
     def _debug(self, msg):
         if self.debug_loss:
@@ -486,17 +486,10 @@ class LoRATrainer:
             f"{old_in} -> {new_in} (new half zero-initialized)"
         )
 
-    def _ensure_noise_schedule(self):
-        """
-        Build a DDPM-style noise schedule once.
-        """
-        if self._noise_schedule_ready:
-            return
-        T = int(self.model.num_train_timesteps)
-        betas = torch.linspace(1e-4, 2e-2, T, device=self.device, dtype=torch.float32)
-        alphas = 1.0 - betas
-        self.alphas_cumprod = torch.cumprod(alphas, dim=0)  # [T]
-        self._noise_schedule_ready = True
+    def _get_num_train_timesteps(self):
+        if self._num_train_timesteps is None:
+            self._num_train_timesteps = int(self.model.num_train_timesteps)
+        return self._num_train_timesteps
 
     def _compute_seq_len_from_latent(self, latent):
         """
@@ -716,6 +709,19 @@ class LoRATrainer:
         """
         Generate qualitative previews from validation samples.
         """
+        # Preview generation calls model.generate() which runs a full FSDP forward.
+        # All ranks must participate in FSDP all-gathers, so we cannot run inference
+        # on rank 0 while other ranks wait at a barrier — that deadlocks and triggers
+        # the NCCL watchdog timeout after 600 s. Skip previews entirely when FSDP is
+        # active; run inference manually after training using inference_with_lora.py.
+        if self.use_fsdp:
+            if self.is_main:
+                logger.info(
+                    "Skipping val previews (FSDP active — run inference_with_lora.py "
+                    "after training to generate previews)."
+                )
+            return
+
         preview_every = int(self.config['training'].get('preview_every_epochs', 1))
         if preview_every <= 0 or (epoch + 1) % preview_every != 0:
             return
@@ -735,13 +741,6 @@ class LoRATrainer:
 
         preview_dir = self.output_dir / "val_previews" / f"epoch_{epoch + 1:03d}"
         preview_dir.mkdir(parents=True, exist_ok=True)
-
-        # Preview generation only runs on rank 0 — it calls model.generate which
-        # is not distributed-aware. Non-rank-0 processes wait at a barrier.
-        if not self.is_main:
-            if self.use_fsdp:
-                dist.barrier()
-            return
 
         logger.info(f"Generating {preview_n} val previews for epoch {epoch + 1} ...")
         was_training = self.model.model.training
@@ -779,10 +778,6 @@ class LoRATrainer:
             logger.info(f"Saved {len(saved_files)} val previews to {preview_dir}")
             for i, (path, vid_tensor) in enumerate(zip(saved_files, preview_tensors)):
                 self._log_video_to_tensorboard(f"val/preview_{i:02d}", vid_tensor, epoch)
-
-        # Release the barrier so other ranks can proceed.
-        if self.use_fsdp:
-            dist.barrier()
     
     def setup_optimizer(self):
         """Setup optimizer and scheduler."""
@@ -823,9 +818,9 @@ class LoRATrainer:
                 f"compute_loss start | source={tuple(source_video.shape)} "
                 f"edited={tuple(edited_video.shape)} batch={source_video.size(0)}"
             )
-        self._ensure_noise_schedule()
+        T = self._get_num_train_timesteps()
         if should_debug:
-            self._debug(f"noise schedule ready in {(time.perf_counter() - t0):.3f}s")
+            self._debug(f"num_train_timesteps={T}")
 
         # 1) Encode source and target videos to latent space.
         self._mem("compute_loss start")
@@ -864,11 +859,11 @@ class LoRATrainer:
         if should_debug:
             self._debug(f"text encode done in {(time.perf_counter() - t2):.3f}s | prompts={len(prompts)}")
 
-        # 3) Random timestep per sample.
+        # 3) Random timestep per sample (flow matching: t in [1, T] as integer index).
         t3 = time.perf_counter()
         t_idx = torch.randint(
-            low=0,
-            high=self.model.num_train_timesteps,
+            low=1,
+            high=T + 1,
             size=(batch_size,),
             device=self.device,
             dtype=torch.long,
@@ -876,26 +871,27 @@ class LoRATrainer:
         if should_debug:
             self._debug(f"sampled timesteps in {(time.perf_counter() - t3):.3f}s")
 
-        # 4) Forward diffusion q(x_t | x_0).
+        # 4) Flow matching forward process: x_t = (1 - sigma_t) * x0 + sigma_t * eps
+        #    sigma_t = t / T,  velocity target = eps - x0
         t4 = time.perf_counter()
         noisy_latents = []
-        eps_targets = []
+        velocity_targets = []
         for i in range(batch_size):
             x0 = target_latents[i]
             eps = torch.randn_like(x0)
-            a_bar = self.alphas_cumprod[t_idx[i]]
-            x_t = torch.sqrt(a_bar) * x0 + torch.sqrt(1.0 - a_bar) * eps
+            sigma_t = t_idx[i].float() / T
+            x_t = (1.0 - sigma_t) * x0 + sigma_t * eps
             noisy_latents.append(x_t)
-            eps_targets.append(eps)
+            velocity_targets.append(eps - x0)
         if should_debug:
-            self._debug(f"forward diffusion build in {(time.perf_counter() - t4):.3f}s")
+            self._debug(f"flow matching forward build in {(time.perf_counter() - t4):.3f}s")
         self._mem("after noise build (noisy_latents ready)")
 
         # WanModel supports t as [B]; it internally expands to [B, seq_len].
         seq_len = self._compute_seq_len_from_latent(target_latents[0])
         t_for_model = t_idx.float()
 
-        # 5) Predict epsilon, conditioned on source latents + text instruction.
+        # 5) Predict velocity, conditioned on source latents + text instruction.
         t5 = time.perf_counter()
         # Cast inputs to match model parameter dtype (float32 for both FSDP and
         # single-GPU paths — FSDP no longer uses param_dtype=bfloat16).
@@ -928,11 +924,11 @@ class LoRATrainer:
                 f"preds={len(eps_pred_list)}"
             )
 
-        # 6) MSE epsilon loss.
+        # 6) MSE flow matching velocity loss.
         t6 = time.perf_counter()
         loss = 0.0
-        for eps_pred, eps_tgt in zip(eps_pred_list, eps_targets):
-            loss = loss + F.mse_loss(eps_pred.float(), eps_tgt.float())
+        for v_pred, v_tgt in zip(eps_pred_list, velocity_targets):
+            loss = loss + F.mse_loss(v_pred.float(), v_tgt.float())
         loss = loss / batch_size
         self._mem("after loss compute")
         if should_debug:
@@ -1067,24 +1063,48 @@ class LoRATrainer:
 
             if self.is_main:
                 checkpoint_path.mkdir(parents=True, exist_ok=True)
-                # Persist only LoRA / modules_to_save parameters to keep the
-                # checkpoint small; the frozen base weights are not needed.
-                lora_state = {
-                    k: v for k, v in full_state.items()
-                    if 'lora_' in k or 'modules_to_save' in k
-                }
+                # Persist only LoRA / modules_to_save parameters.
+                # PEFT's loader expects modules_to_save keys WITHOUT the
+                # '.modules_to_save.<adapter_name>' segment — it strips that
+                # part on save and re-inserts it on load.
+                # e.g. FSDP full key:
+                #   base_model.model.patch_embedding.modules_to_save.default.weight
+                # must become:
+                #   base_model.model.patch_embedding.weight
+                import re as _re
+                lora_state = {}
+                for k, v in full_state.items():
+                    if 'lora_' in k:
+                        lora_state[k] = v
+                    elif 'modules_to_save' in k:
+                        # strip '.modules_to_save.<adapter_name>' from key
+                        norm_k = _re.sub(r'\.modules_to_save\.[^.]+', '', k)
+                        lora_state[norm_k] = v
                 torch.save(lora_state, checkpoint_path / "adapter_model.bin")
-                # Also copy the PEFT adapter config so the checkpoint is
-                # loadable with load_adapter / from_pretrained.
+                # Save PEFT adapter config so the checkpoint is loadable with
+                # PeftModel.from_pretrained. to_dict() can return Python sets
+                # (e.g. target_modules) which are not JSON-serializable; convert
+                # them to sorted lists before dumping.
                 try:
-                    self.model.model._peft_config  # attribute exists on PeftModel
                     import json as _json
+
+                    def _make_serializable(obj):
+                        if isinstance(obj, set):
+                            return sorted(list(obj))
+                        if isinstance(obj, dict):
+                            return {k: _make_serializable(v) for k, v in obj.items()}
+                        if isinstance(obj, (list, tuple)):
+                            return [_make_serializable(v) for v in obj]
+                        if hasattr(obj, 'value'):  # enum
+                            return obj.value
+                        return obj
+
                     for adapter_name, peft_cfg in self.model.model.peft_config.items():
-                        cfg_dict = peft_cfg.to_dict()
+                        cfg_dict = _make_serializable(peft_cfg.to_dict())
                         with open(checkpoint_path / "adapter_config.json", 'w') as f:
                             _json.dump(cfg_dict, f, indent=2)
-                except Exception:
-                    pass
+                except Exception as cfg_err:
+                    logger.warning(f"Could not save adapter_config.json: {cfg_err}")
                 logger.info(f"[rank0] 💾 Saved FSDP checkpoint to {checkpoint_path}")
         else:
             if self.is_main:

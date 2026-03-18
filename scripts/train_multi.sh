@@ -141,8 +141,8 @@ cat > configs/ghibli_style_lora_medium_fsdp.yaml <<EOF
 model:
   base_model_path: "/mnt/localssd/Wan2.2-TI2V-5B"
   task: "ti2v-5B"
-  lora_rank: 16
-  lora_alpha: 16
+  lora_rank: 256
+  lora_alpha: 256
   lora_dropout: 0.05
   target_modules: ["q", "k", "v", "o"]
   param_dtype: "bfloat16"
